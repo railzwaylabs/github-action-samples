@@ -68,7 +68,9 @@ func handler() http.Handler {
 
 func index(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<html><body><h1>Profiles</h1><a href="profile">profile</a><br><a href="heap">heap</a><br><a href="goroutine?debug=1">goroutine</a><br><a href="trace">trace</a></body></html>`)
+	if _, err := fmt.Fprint(w, `<html><body><h1>Profiles</h1><a href="profile">profile</a><br><a href="heap">heap</a><br><a href="goroutine?debug=1">goroutine</a><br><a href="trace">trace</a></body></html>`); err != nil {
+		return
+	}
 }
 
 func cpuProfile(w http.ResponseWriter, r *http.Request) {
