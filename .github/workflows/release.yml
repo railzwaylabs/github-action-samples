@@ -1,0 +1,209 @@
+name: Release pipeline
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: Successful CI run ID containing the release artifact
+        required: true
+        type: string
+      release_sha:
+        description: Full commit SHA associated with the CI run
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: release-production
+  cancel-in-progress: false
+
+env:
+  CI_RUN_ID: ${{ inputs.ci_run_id || github.event.workflow_run.id }}
+  RELEASE_SHA: ${{ inputs.release_sha || github.event.workflow_run.head_sha }}
+
+jobs:
+  admit:
+    name: Admit CI artifact
+    if: >-
+      vars.ENABLE_DEPLOYMENTS == 'true' &&
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.resolve.outputs.artifact_name }}
+    steps:
+      - name: Resolve immutable artifact
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifact_name="release-${RELEASE_SHA}"
+          found="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${CI_RUN_ID}/artifacts" \
+            --jq ".artifacts[] | select(.name == \"${artifact_name}\") | .name")"
+          test "$found" = "$artifact_name"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+
+  staging:
+    name: Deploy test / staging
+    needs: admit
+    runs-on: [self-hosted, linux, x64]
+    environment: staging
+    env:
+      NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+      NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+      CONSUL_HTTP_ADDR: ${{ secrets.CONSUL_HTTP_ADDR }}
+      CONSUL_HTTP_TOKEN: ${{ secrets.CONSUL_HTTP_TOKEN }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NOMAD_DATACENTERS: ${{ vars.NOMAD_DATACENTERS || '["dc1"]' }}
+      NOMAD_COUNT: ${{ vars.NOMAD_COUNT || '1' }}
+      APP_HOST: ${{ vars.APP_HOST }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.admit.outputs.artifact_name }}
+          run-id: ${{ env.CI_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: release
+      - name: Verify artifact integrity
+        working-directory: release
+        run: sha256sum --check *.sha256
+      - name: Deploy staging
+        env:
+          DEPLOY_ENVIRONMENT: staging
+          RELEASE_ARTIFACT: release/${{ needs.admit.outputs.artifact_name }}.tar.gz
+          RELEASE_SHA: ${{ env.RELEASE_SHA }}
+        run: ./scripts/deploy.sh
+      - name: Wait for staging health
+        env:
+          HEALTH_URL: ${{ vars.HEALTH_URL }}
+        run: ./scripts/health-check.sh "$HEALTH_URL"
+
+  ptr:
+    name: PTR / ${{ matrix.suite }}
+    needs: staging
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [frontend-e2e, public-api, backend-critical-flow, cross-service-business-flow]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+      - uses: actions/setup-node@v4
+        if: matrix.suite == 'frontend-e2e'
+        with:
+          node-version: "22"
+      - uses: pnpm/action-setup@v4
+        if: matrix.suite == 'frontend-e2e'
+        with:
+          version: 12.3.4
+      - name: Install frontend test dependencies
+        if: matrix.suite == 'frontend-e2e'
+        run: pnpm install --no-frozen-lockfile
+      - name: Install Chromium
+        if: matrix.suite == 'frontend-e2e'
+        run: pnpm --filter github-actions-sample-web exec playwright install --with-deps chromium
+      - name: Run production test readiness suite
+        env:
+          PTR_BASE_URL: ${{ vars.STAGING_BASE_URL }}
+        run: ./scripts/ptr.sh "${{ matrix.suite }}" "$PTR_BASE_URL"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ptr-${{ matrix.suite }}-${{ env.RELEASE_SHA }}
+          path: test-results/
+          retention-days: 30
+          if-no-files-found: ignore
+
+  qa-review:
+    name: QA test review
+    needs: ptr
+    runs-on: ubuntu-latest
+    environment: qa-review
+    steps:
+      - run: echo "QA approved PTR run ${CI_RUN_ID} for ${RELEASE_SHA}" >> "$GITHUB_STEP_SUMMARY"
+
+  uat:
+    name: Business UAT
+    needs: qa-review
+    runs-on: ubuntu-latest
+    environment: uat
+    steps:
+      - run: echo "Business approved ${RELEASE_SHA}" >> "$GITHUB_STEP_SUMMARY"
+
+  production:
+    name: Production deployment
+    needs: [admit, uat]
+    runs-on: [self-hosted, linux, x64]
+    environment: production
+    env:
+      NOMAD_ADDR: ${{ secrets.NOMAD_ADDR }}
+      NOMAD_TOKEN: ${{ secrets.NOMAD_TOKEN }}
+      CONSUL_HTTP_ADDR: ${{ secrets.CONSUL_HTTP_ADDR }}
+      CONSUL_HTTP_TOKEN: ${{ secrets.CONSUL_HTTP_TOKEN }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      NOMAD_DATACENTERS: ${{ vars.NOMAD_DATACENTERS || '["dc1"]' }}
+      NOMAD_COUNT: ${{ vars.NOMAD_COUNT || '1' }}
+      APP_HOST: ${{ vars.APP_HOST }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.admit.outputs.artifact_name }}
+          run-id: ${{ env.CI_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: release
+      - name: Verify artifact integrity
+        working-directory: release
+        run: sha256sum --check *.sha256
+      - name: Deploy the same artifact to production
+        id: deploy
+        env:
+          DEPLOY_ENVIRONMENT: production
+          RELEASE_ARTIFACT: release/${{ needs.admit.outputs.artifact_name }}.tar.gz
+          RELEASE_SHA: ${{ env.RELEASE_SHA }}
+        run: ./scripts/deploy.sh
+      - name: Nomad deployment verification
+        run: ./scripts/verify-nomad.sh
+      - name: Consul health check and production smoke test
+        env:
+          HEALTH_URL: ${{ vars.HEALTH_URL }}
+          SMOKE_BASE_URL: ${{ vars.SMOKE_BASE_URL }}
+        run: |
+          ./scripts/health-check.sh "$HEALTH_URL"
+          ./scripts/smoke-test.sh "$SMOKE_BASE_URL"
+      - name: Mark release as last known good
+        run: ./scripts/mark-successful.sh
+      - name: Automatic rollback
+        id: rollback
+        if: failure() && steps.deploy.outcome == 'success'
+        env:
+          DEPLOY_ENVIRONMENT: production
+        run: ./scripts/rollback.sh
+      - name: Verify automatic rollback
+        if: failure() && steps.rollback.outcome == 'success'
+        env:
+          HEALTH_URL: ${{ vars.HEALTH_URL }}
+          SMOKE_BASE_URL: ${{ vars.SMOKE_BASE_URL }}
+        run: |
+          ./scripts/verify-nomad.sh
+          ./scripts/health-check.sh "$HEALTH_URL"
+          ./scripts/smoke-test.sh "$SMOKE_BASE_URL"
+      - name: Create incident summary
+        if: failure()
+        run: |
+          echo "## Production deployment failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release: ${RELEASE_SHA}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Automatic rollback was requested." >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,37 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# JavaScript dependencies and build output
+node_modules/
+.pnpm-store/
+dist/
+apps/*/dist/
+
+# Test and coverage artifacts
+coverage.out
+coverage/
+*.coverprofile
+test-results/
+playwright-report/
+blob-report/
+
+# Go build and profiling artifacts
+bin/
+*.test
+*.prof
+*.trace
+
+# Local platform state
+.vercel/
+
+# Logs
+*.log
+pnpm-debug.log*
+npm-debug.log*
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/

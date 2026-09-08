@@ -1,0 +1,286 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore: ["**/*.md", "docs/**"]
+  push:
+    branches: [main]
+    paths-ignore: ["**/*.md", "docs/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  lint:
+    name: Lint / static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Check formatting
+        run: test -z "$(find . -type f -name '*.go' -not -path './vendor/*' -exec gofmt -l {} +)"
+      - name: Vet
+        run: go vet ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.8.0
+          args: --timeout=5m
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - run: go test -race -shuffle=on -count=1 ./...
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: orders_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test -d orders_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://test:test@localhost:5432/orders_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Apply database migrations
+        run: go run ./cmd/sample migrate up
+      - run: go test -race -tags=integration -count=1 ./...
+
+  api_e2e:
+    name: API E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: orders_e2e
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test -d orders_e2e"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://test:test@localhost:5432/orders_e2e?sslmode=disable
+      E2E_BASE_URL: http://localhost:8080
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Apply database migrations
+        run: go run ./cmd/sample migrate up
+      - name: Start backend
+        run: |
+          nohup go run ./cmd/sample > /tmp/sample-api.log 2>&1 &
+          echo $! > /tmp/sample-api.pid
+          ./scripts/health-check.sh http://localhost:8080/ready
+      - name: Run backend black-box E2E
+        run: ./scripts/backend-e2e.sh "$E2E_BASE_URL"
+      - name: Upload backend E2E evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-e2e-${{ github.sha }}
+          path: |
+            test-results/backend-e2e.json
+            /tmp/sample-api.log
+          retention-days: 14
+          if-no-files-found: error
+
+  frontend_e2e:
+    name: Frontend E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: orders_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U test -d orders_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://test:test@localhost:5432/orders_test?sslmode=disable
+      PLAYWRIGHT_BASE_URL: http://127.0.0.1:5173
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.3.4
+      - name: Apply database migrations
+        run: go run ./cmd/sample migrate up
+      - name: Install and build frontend
+        run: |
+          pnpm install --no-frozen-lockfile
+          pnpm --filter github-actions-sample-web build
+      - name: Start backend API
+        run: |
+          go run ./cmd/sample > /tmp/sample-api.log 2>&1 &
+          echo $! > /tmp/sample-api.pid
+          for attempt in {1..30}; do
+            curl --fail --silent http://localhost:8080/ready && exit 0
+            sleep 1
+          done
+          cat /tmp/sample-api.log
+          exit 1
+      - name: Install Chromium
+        run: pnpm --filter github-actions-sample-web exec playwright install --with-deps chromium
+      - name: Run Playwright
+        run: pnpm --filter github-actions-sample-web test:e2e
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-e2e-${{ github.sha }}
+          path: |
+            apps/sample/playwright-report/
+            apps/sample/test-results/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Test and enforce coverage floor
+        env:
+          MIN_COVERAGE: ${{ vars.MIN_COVERAGE || '0' }}
+        run: |
+          go test -covermode=atomic -coverprofile=coverage.out ./...
+          go tool cover -func=coverage.out
+          actual="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')"
+          awk -v actual="$actual" -v minimum="$MIN_COVERAGE" 'BEGIN { if (actual + 0 < minimum + 0) exit 1 }'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.sha }}
+          path: coverage.out
+          retention-days: 14
+          if-no-files-found: error
+
+  quality-gate:
+    name: CI quality gate
+    runs-on: ubuntu-latest
+    needs: [lint, unit, integration, api_e2e, frontend_e2e, coverage]
+    if: always()
+    steps:
+      - name: Require every CI lane to pass
+        env:
+          LINT: ${{ needs.lint.result }}
+          UNIT: ${{ needs.unit.result }}
+          INTEGRATION: ${{ needs.integration.result }}
+          API_E2E: ${{ needs.api_e2e.result }}
+          FRONTEND_E2E: ${{ needs.frontend_e2e.result }}
+          COVERAGE: ${{ needs.coverage.result }}
+        run: |
+          for result in "$LINT" "$UNIT" "$INTEGRATION" "$API_E2E" "$FRONTEND_E2E" "$COVERAGE"; do
+            test "$result" = success || exit 1
+          done
+
+  build-artifact:
+    name: Build immutable artifact
+    if: github.event_name != 'pull_request'
+    needs: quality-gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      artifact_name: ${{ steps.bundle.outputs.name }}
+      sha256: ${{ steps.bundle.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Verify all packages build
+        run: go build ./...
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Resolve image name
+        id: image
+        run: echo "repository=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Build and push container
+        id: container
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image.outputs.repository }}:sha-${{ github.sha }}
+          build-args: VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Create immutable release bundle
+        id: bundle
+        run: |
+          name="release-${GITHUB_SHA}"
+          printf 'IMAGE_REF=%s@%s\nRELEASE_SHA=%s\n' \
+            '${{ steps.image.outputs.repository }}' '${{ steps.container.outputs.digest }}' "$GITHUB_SHA" > release.env
+          tar -czf "${name}.tar.gz" release.env
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d ' ' -f1 "${name}.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.bundle.outputs.name }}
+          path: |
+            ${{ steps.bundle.outputs.name }}.tar.gz
+            ${{ steps.bundle.outputs.name }}.tar.gz.sha256
+          retention-days: 30
+          if-no-files-found: error

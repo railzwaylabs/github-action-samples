@@ -1,0 +1,10 @@
+{
+  "name": "github-actions-samples-workspace",
+  "private": true,
+  "packageManager": "pnpm@12.3.4",
+  "scripts": {
+    "dev:web": "pnpm --filter github-actions-sample-web dev",
+    "build:web": "pnpm --filter github-actions-sample-web build",
+    "test:e2e": "pnpm --filter github-actions-sample-web test:e2e"
+  }
+}
