@@ -122,10 +122,18 @@ func TestOrderContractValidation(t *testing.T) {
 }
 
 func TestUnknownOrderReturnsNotFound(t *testing.T) {
-	response := request(t, http.MethodGet, "/orders/does-not-exist", nil)
+	response := request(t, http.MethodGet, "/orders/00000000-0000-4000-8000-000000000000", nil)
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", response.StatusCode, readBody(response.Body))
+	}
+}
+
+func TestMalformedOrderIDReturnsBadRequest(t *testing.T) {
+	response := request(t, http.MethodGet, "/orders/does-not-exist", nil)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", response.StatusCode, readBody(response.Body))
 	}
 }
 

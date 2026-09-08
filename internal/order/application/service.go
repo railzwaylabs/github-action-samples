@@ -2,19 +2,21 @@ package application
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/railzwaylabs/github-actions-samples/internal/order/domain"
 	"github.com/railzwaylabs/github-actions-samples/internal/order/infrastructure/persistent"
 )
 
-var ErrOrderNotFound = errors.New("order not found")
+var (
+	ErrInvalidOrderID = errors.New("invalid order ID")
+	ErrOrderNotFound  = errors.New("order not found")
+)
 
 type CreateOrderInput struct {
 	CustomerID string
@@ -42,6 +44,9 @@ func (s *service) List(ctx context.Context) ([]*domain.Order, error) {
 }
 
 func (s *service) Get(ctx context.Context, id string) (*domain.Order, error) {
+	if _, err := uuid.Parse(id); err != nil {
+		return nil, ErrInvalidOrderID
+	}
 	order, err := s.orders.GetOrder(ctx, id)
 	if errors.Is(err, persistent.ErrNotFound) {
 		return nil, ErrOrderNotFound
@@ -87,12 +92,9 @@ func (s *service) Create(ctx context.Context, input CreateOrderInput) (*domain.O
 }
 
 func randomUUID() (string, error) {
-	var value [16]byte
-	if _, err := rand.Read(value[:]); err != nil {
+	value, err := uuid.NewRandom()
+	if err != nil {
 		return "", err
 	}
-	value[6] = (value[6] & 0x0f) | 0x40
-	value[8] = (value[8] & 0x3f) | 0x80
-	raw := hex.EncodeToString(value[:])
-	return raw[0:8] + "-" + raw[8:12] + "-" + raw[12:16] + "-" + raw[16:20] + "-" + raw[20:32], nil
+	return value.String(), nil
 }

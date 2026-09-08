@@ -35,6 +35,10 @@ func (h *Handler) List(c *gin.Context) {
 
 func (h *Handler) Get(c *gin.Context) {
 	order, err := h.orders.Get(c.Request.Context(), c.Param("id"))
+	if errors.Is(err, application.ErrInvalidOrderID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if errors.Is(err, application.ErrOrderNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
